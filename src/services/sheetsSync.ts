@@ -37,16 +37,47 @@ function doPost(e) {
 
     var rawBody = e && e.postData && e.postData.contents ? e.postData.contents : '{}';
     var data = JSON.parse(rawBody);
+    var existingRows = sheet.getDataRange().getValues();
 
+    // تسجيل طالب جديد من لوحة المعلم (بإحصائيات صفرية إن لم يكن الكود موجوداً)
+    if (data.action === 'registerStudent') {
+      var newCode = String(data.studentCode || '').trim();
+      for (var r = 1; r < existingRows.length; r++) {
+        if (String(existingRows[r][2]).trim().toLowerCase() === newCode.toLowerCase()) {
+          return ContentService.createTextOutput(JSON.stringify({ ok: true, alreadyExists: true }))
+            .setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+
+      var newRow = [
+        String(data.studentId || newCode || ''),
+        String(data.studentName || '').trim(),
+        newCode,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        new Date().toISOString(),
+        '[]'
+      ];
+      sheet.appendRow(newRow);
+
+      return ContentService.createTextOutput(JSON.stringify({ ok: true, registered: true }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // تحديث أو إضافة صف تقدم الطالب عند إتمام أي تدريب أو امتحان
     var breakdownStr =
       typeof data.chaptersBreakdown === 'string'
         ? data.chaptersBreakdown
         : JSON.stringify(data.chaptersBreakdown || []);
 
     var rowValues = [
-      data.studentId || '',
-      data.studentName || '',
-      data.studentCode || '',
+      String(data.studentId || ''),
+      String(data.studentName || ''),
+      String(data.studentCode || ''),
       Number(data.totalSolved || 0),
       Number(data.correctCount || 0),
       Number(data.wrongCount || 0),
@@ -57,11 +88,14 @@ function doPost(e) {
       breakdownStr
     ];
 
-    // تحديث صف الطالب إن كان موجوداً بالفعل، أو إضافة صف جديد له
-    var existingRows = sheet.getDataRange().getValues();
     var targetRowIndex = -1;
     for (var i = 1; i < existingRows.length; i++) {
-      if (String(existingRows[i][0]) === String(data.studentId)) {
+      var rowId = String(existingRows[i][0]).trim();
+      var rowCode = String(existingRows[i][2]).trim();
+      if (
+        (data.studentId && rowId === String(data.studentId).trim()) ||
+        (data.studentCode && rowCode.toLowerCase() === String(data.studentCode).trim().toLowerCase())
+      ) {
         targetRowIndex = i + 1;
         break;
       }
@@ -87,7 +121,7 @@ function doGet(e) {
     var values = sheet.getDataRange().getValues();
 
     if (values.length <= 1) {
-      return ContentService.createTextOutput(JSON.stringify({ ok: true, students: [] }))
+      return ContentService.createTextOutput(JSON.stringify([]))
         .setMimeType(ContentService.MimeType.JSON);
     }
 
@@ -96,7 +130,7 @@ function doGet(e) {
 
     for (var i = 1; i < values.length; i++) {
       var row = values[i];
-      if (!row[0] && !row[1]) continue;
+      if (!row[0] && !row[1] && !row[2]) continue;
 
       var item = {};
       for (var c = 0; c < headers.length; c++) {
@@ -130,22 +164,25 @@ function doGet(e) {
       });
     }
 
-    return ContentService.createTextOutput(JSON.stringify({ ok: true, students: students }))
+    return ContentService.createTextOutput(JSON.stringify(students))
       .setMimeType(ContentService.MimeType.JSON);
   } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: String(err), students: [] }))
+    return ContentService.createTextOutput(JSON.stringify([]))
       .setMimeType(ContentService.MimeType.JSON);
   }
 }
 ================================================================================
 */
 
-import { SheetsSyncPayload } from '../types';
+import { ALLOWED_STUDENTS, authenticateStudent } from '../data/students';
+import { SheetsSyncPayload, Student } from '../types';
 
-export const GOOGLE_SCRIPT_WEB_APP_URL = '';
+export const GOOGLE_SCRIPT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxA27jKarngLH1l9aIK8vVxd_vNj1UZG6dXTMqluOcaBe6VoFd0VzE7snVvPXqQFdR_fQ/exec';
 
 const LOCAL_SYNC_BACKUP_KEY = 'chinese_portal_sheets_sync_backup_v1';
 const STUDENT_PROGRESS_PREFIX = 'chinese_portal_progress_v1_';
+const TEACHER_URL_STORAGE_KEY = 'teacher_dashboard_sheets_url_v1';
+const LOCAL_REGISTERED_STUDENTS_KEY = 'chinese_portal_registered_students_v1';
 const TOTAL_CHAPTERS = 15;
 
 export interface ChapterBreakdownEntry {
@@ -163,6 +200,137 @@ export interface SyncResult {
   syncedRemotely: boolean;
   savedLocally: boolean;
   timestamp: string;
+}
+
+function getEffectiveScriptUrl(): string {
+  const configured = GOOGLE_SCRIPT_WEB_APP_URL.trim();
+  if (configured) return configured;
+
+  try {
+    const saved = localStorage.getItem(TEACHER_URL_STORAGE_KEY);
+    return saved ? saved.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+function registerDynamicStudentInMemory(student: Student): void {
+  const exists = ALLOWED_STUDENTS.some(
+    (s) =>
+      s.id.toLowerCase() === student.id.toLowerCase() ||
+      (s.name.trim() === student.name.trim() &&
+        s.code.trim().toLowerCase() === student.code.trim().toLowerCase())
+  );
+  if (!exists) {
+    ALLOWED_STUDENTS.push(student);
+  }
+}
+
+function findLocallyRegisteredStudent(name: string, code: string): Student | null {
+  const cleanedName = name.trim().toLowerCase();
+  const cleanedCode = code.trim().toLowerCase();
+  if (!cleanedName || !cleanedCode) return null;
+
+  try {
+    const raw = localStorage.getItem(LOCAL_REGISTERED_STUDENTS_KEY);
+    if (!raw) return null;
+    const list = JSON.parse(raw) as Array<{
+      studentId?: string;
+      id?: string;
+      studentName?: string;
+      name?: string;
+      studentCode?: string;
+      code?: string;
+    }>;
+
+    if (!Array.isArray(list)) return null;
+
+    for (const item of list) {
+      const sName = String(item.studentName ?? item.name ?? '').trim();
+      const sCode = String(item.studentCode ?? item.code ?? '').trim();
+      const sId = String(item.studentId ?? item.id ?? sCode).trim();
+      if (
+        (sName.toLowerCase() === cleanedName || sId.toLowerCase() === cleanedName) &&
+        sCode.toLowerCase() === cleanedCode
+      ) {
+        const matched: Student = { id: sId, name: sName, code: sCode };
+        registerDynamicStudentInMemory(matched);
+        return matched;
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * التحقق الديناميكي من بيانات الطالب عبر Google Sheets (GET) مع الرجوع الآمن
+ * إلى القائمة المحلية (students.ts والطلاب المولّدين محلياً) في حال عدم توفر الاتصال أو الرابط.
+ */
+export async function verifyStudentFromSheet(
+  name: string,
+  code: string
+): Promise<Student | null> {
+  const cleanedName = name.trim();
+  const cleanedCode = code.trim();
+  if (!cleanedName || !cleanedCode) return null;
+
+  const endpoint = getEffectiveScriptUrl();
+
+  if (endpoint) {
+    try {
+      const response = await fetch(endpoint, { method: 'GET' });
+      if (response.ok) {
+        const data: unknown = await response.json();
+        const rows = Array.isArray(data)
+          ? data
+          : data &&
+              typeof data === 'object' &&
+              'students' in data &&
+              Array.isArray((data as { students?: unknown }).students)
+            ? (data as { students: unknown[] }).students
+            : data &&
+                typeof data === 'object' &&
+                'rows' in data &&
+                Array.isArray((data as { rows?: unknown }).rows)
+              ? (data as { rows: unknown[] }).rows
+              : [];
+
+        for (const rawRow of rows) {
+          if (!rawRow || typeof rawRow !== 'object') continue;
+          const row = rawRow as Record<string, unknown>;
+          const rowName = String(row.studentName ?? row.name ?? '').trim();
+          const rowCode = String(row.studentCode ?? row.code ?? '').trim();
+          const rowId = String(row.studentId ?? row.id ?? rowCode).trim();
+
+          if (
+            (rowName.toLowerCase() === cleanedName.toLowerCase() ||
+              rowId.toLowerCase() === cleanedName.toLowerCase()) &&
+            rowCode.toLowerCase() === cleanedCode.toLowerCase()
+          ) {
+            const matched: Student = {
+              id: rowId || rowCode,
+              name: rowName || cleanedName,
+              code: rowCode,
+            };
+            registerDynamicStudentInMemory(matched);
+            return matched;
+          }
+        }
+      }
+    } catch {
+      // في حال انقطاع الاتصال أو خطأ الشبكة، ننتقل إلى التحقق الاحتياطي المحلي أدناه
+    }
+  }
+
+  const localDynamic = findLocallyRegisteredStudent(cleanedName, cleanedCode);
+  if (localDynamic) {
+    return localDynamic;
+  }
+
+  return authenticateStudent(cleanedName, cleanedCode);
 }
 
 function buildChaptersBreakdownFromStorage(studentId: string): ChapterBreakdownEntry[] {
@@ -241,7 +409,7 @@ export async function syncStudentStatsToSheets(
 
   saveLocalBackup(enrichedPayload);
 
-  const endpoint = GOOGLE_SCRIPT_WEB_APP_URL.trim();
+  const endpoint = getEffectiveScriptUrl();
   if (!endpoint) {
     return {
       syncedRemotely: false,
